@@ -88,7 +88,7 @@
   <section id="view-home" class="view active">
     <div class="hero"><div><div class="eyebrow">Today // Command Centre</div><h2>Your day, in motion.</h2><p>A high-level view of deadlines, meetings, workload, project progress and items that need attention.</p></div></div>
     <div class="command-rail"><div class="globalbar"><span class="search-icon">⌕</span><input id="globalSearch" oninput="searchGlobal(this.value)" placeholder="Global search — tasks, meetings, notes, streams…"><div id="searchResults" class="search-results"></div></div><div class="command-actions"><button class="global-chip" onclick="openTaskModal()">＋ Task</button><button class="global-chip meeting-chip" onclick="openMeetingModal()">◷ Meeting</button><button class="global-chip" onclick="openNoteModal()">✎ Note</button><button class="global-chip" onclick="openGlobalFiles()">▱ Files</button><button class="global-chip" onclick="openRegister()">Open register</button></div></div>
-    <div id="serverBanner" class="server-banner warn">Waiting for server handshake… local changes are safe in the browser until synchronized.</div>
+    <div id="serverBanner" class="server-banner warn">Waiting for Apps Script connection… local changes are safe in the browser until synchronized.<span id="apiConfigHint" class="help" style="display:block;margin-top:4px"></span></div>
     <div class="grid two">
       <div class="card"><div class="section-head"><div><h3>Attention queue</h3><div class="card-sub">Overdue, due today and high priority items.</div></div><button class="btn small" onclick="go('tasks')">Open register</button></div><div id="attentionList" class="attention-list"></div></div>
       <div class="card"><div class="section-head"><div><h3>Today's agenda</h3><div class="card-sub">Meetings and deadlines by time.</div></div><button class="btn small" onclick="go('calendar')">Calendar</button></div><div id="agendaList" class="agenda-list"></div></div>
@@ -157,9 +157,16 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
 <script>
-const APP_VERSION='1.1.0';
-const LS_KEY='workflow_local_v1';
-const QUEUE_KEY='workflow_queue_v1';
+const APP_VERSION='1.2.0';
+/* GitHub Pages frontend -> Google Apps Script API.
+   After deploying Code.gs as a Web App, paste its /exec URL below. */
+const CONFIG={
+  APPS_SCRIPT_URL:'PASTE_YOUR_APPS_SCRIPT_EXEC_URL_HERE',
+  API_TIMEOUT_MS:15000,
+  QUEUE_BATCH_SIZE:3
+};
+const LS_KEY='workflow_local_v2';
+const QUEUE_KEY='workflow_queue_v2';
 const DAY_NAMES=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
 let state={serverOnline:false,serverData:{streams:[],tasks:[],meetings:[],notes:[],settings:{},meta:{}},localDraft:null,queue:[],view:'home',currentStreamId:null,calendar:null,workspaceCalendar:null,charts:{},uploading:false,uploadStartedAt:null};
 const LOGIN_KEY='workflow_login_v1';
@@ -182,16 +189,27 @@ function showToast(msg){const t=q('#toast');t.textContent=msg;t.classList.add('s
 function setStatus(kind,text){const el=q('#connectionStatus');if(!el)return;el.className='status '+kind;el.textContent=text}
 function setBanner(kind,text){const b=q('#serverBanner');if(!b)return;b.className='server-banner '+kind;b.innerHTML=text}
 function updateUploadStatus(){if(!state.serverOnline){setStatus('offline','Offline');return}if(state.uploading){setStatus('sync',`Uploading ${state.queue.length} change${state.queue.length===1?'':'s'}…`);return}setStatus('online','Google connected')}
+function appsScriptReady(){return /^https:\/(\/)?script\.google\.com\/macros\/s\/[^\s]+\/exec(?:\?.*)?$/.test(CONFIG.APPS_SCRIPT_URL||'')}
 function callServer(fn,args=[],cb=()=>{},fail=()=>{}){
-  if(typeof google==='undefined' || !google.script || !google.script.run){fail(new Error('Apps Script runtime unavailable'));return}
-  google.script.run.withSuccessHandler(r=>cb(r)).withFailureHandler(e=>fail(e))[fn](...args)
+  if(!appsScriptReady()){fail(new Error('Apps Script URL is not configured. Set CONFIG.APPS_SCRIPT_URL in index.html to your deployed /exec URL.'));return}
+  const callback='workflowJsonp_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+  const script=document.createElement('script');
+  let finished=false;
+  const cleanup=()=>{finished=true;try{script.remove()}catch(e){};try{delete window[callback]}catch(e){window[callback]=undefined}};
+  const timer=setTimeout(()=>{if(finished)return;cleanup();fail(new Error('Apps Script request timed out.'))},CONFIG.API_TIMEOUT_MS);
+  window[callback]=(response)=>{if(finished)return;clearTimeout(timer);cleanup();if(!response||response.ok!==true){fail(new Error(response?.error||'Apps Script returned an invalid response.'));return}cb(response.result)};
+  script.onerror=()=>{if(finished)return;clearTimeout(timer);cleanup();fail(new Error('Could not reach the Apps Script Web App.'))};
+  const base=CONFIG.APPS_SCRIPT_URL.replace(/\?$/,'');
+  const params=new URLSearchParams({api:fn,callback,args:JSON.stringify(args)});
+  script.src=base+(base.includes('?')?'&':'?')+params.toString();
+  document.head.appendChild(script);
 }
 function loginUser(){const name=(q('#loginName').value||'').trim();const email=(q('#loginEmail').value||'').trim();if(!name){q('#loginName').focus();showLoginError('Please enter your name.');return}if(email&&!/^\S+@\S+\.\S+$/.test(email)){q('#loginEmail').focus();showLoginError('Please enter a valid email or leave it blank.');return}localStorage.setItem(LOGIN_KEY,JSON.stringify({name,email,at:Date.now()}));q('#loginScreen').classList.add('hidden');q('#profileName').textContent=name;handshake()}
 function showLoginError(msg){const e=q('#loginError');e.textContent=msg;e.classList.add('show')}
 function logoutUser(){localStorage.removeItem(LOGIN_KEY);location.reload()}
 function restoreLogin(){try{const x=JSON.parse(localStorage.getItem(LOGIN_KEY)||'null');if(x?.name){q('#loginScreen').classList.add('hidden');q('#profileName').textContent=x.name;return true}}catch(e){}return false}
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&q('#loginScreen')&&!q('#loginScreen').classList.contains('hidden'))loginUser()});
-function init(){loadLocal();const loggedIn=restoreLogin();render();if(loggedIn)handshake();setInterval(()=>{if(state.serverOnline&&state.queue.length)flushQueue(true)},45000);window.addEventListener('beforeunload',persistLocal)}
+function init(){loadLocal();const hint=q('#apiConfigHint');if(hint&&!appsScriptReady())hint.textContent='Setup required: paste your Apps Script /exec URL into CONFIG.APPS_SCRIPT_URL in this file.';const loggedIn=restoreLogin();render();if(loggedIn)handshake();setInterval(()=>{if(state.serverOnline&&state.queue.length)flushQueue(true)},45000);window.addEventListener('beforeunload',persistLocal)}
 function handshake(){setStatus('sync','Connecting to Google…');setBanner('warn','Checking the Apps Script ↔ Google Sheet connection…');callServer('api_boot',[],r=>{state.serverOnline=true;state.serverData=r.data||state.serverData;state.serverData.meta=r.meta||{};if(!state.localDraft||!state.queue.length)state.localDraft=clone(state.serverData);updateUploadStatus();setBanner('good',`Google Sheet connected · ${esc(state.serverData.meta.appVersion||APP_VERSION)} · last confirmed save ${fmtDateTime(state.serverData.meta.lastSync||nowISO())}`);render();if(state.queue.length)flushQueue(true)},e=>{state.serverOnline=false;state.uploading=false;setStatus('offline','Offline');setBanner('bad',`Apps Script could not reach the Google Sheet. <strong>${esc(e.message||e)}</strong><br><span class="help">Your local changes remain saved in this browser and will be uploaded when the Google connection is restored.</span>`);render()})}
 function go(view){state.view=view; qa('.view').forEach(x=>x.classList.remove('active')); q('#view-'+view).classList.add('active'); qa('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===view)); if(view==='calendar')renderCalendar(); if(view==='analytics')renderAnalytics(); if(view==='tasks')renderTaskRegister(); if(view==='meetings')renderMeetingRegister(); if(view==='notes')renderNotes(); if(view==='settings')renderSettings(); if(view==='streams')renderStreamsPage(); window.scrollTo({top:0,behavior:'smooth'})}
 function toggleSidebar(){showToast('Navigation is available in the top bar.')} 
@@ -248,13 +266,22 @@ function saveStream(existingId){const d=clone(activeData());let s=existingId?d.s
 function queueWrite(op,nextData){state.localDraft=nextData;state.queue.push({...op,clientId:uid('q'),queuedAt:nowISO()});persistLocal();if(state.serverOnline){setStatus('sync',`Uploading ${state.queue.length} change${state.queue.length===1?'':'s'}…`);setBanner('warn',`Local save complete. <strong>${state.queue.length}</strong> change${state.queue.length===1?'':'s'} waiting for Google Sheet confirmation.`)}else{setStatus('offline','Offline');setBanner('warn',`Saved locally. <strong>${state.queue.length}</strong> change${state.queue.length===1?'':'s'} waiting for Google Sheet upload.`)}}
 function deleteEntity(entity,id){const d=clone(activeData());const key=entity==='task'?'tasks':entity==='meeting'?'meetings':entity==='note'?'notes':'streams';const item=d[key].find(x=>x.id===id);if(!item)return;if(!confirm(`Delete ${entity} “${item.title||item.name||''}”?`))return;d[key]=d[key].filter(x=>x.id!==id);queueWrite({action:'delete',entity,id},d);render();showToast(`${entity} deleted locally and queued.`);if(state.serverOnline)flushQueue(true)}
 function flushQueue(silent=false){
-  if(!state.serverOnline||!state.queue.length)return;
-  state.uploading=true;updateUploadStatus();setBanner('warn',`Uploading <strong>${state.queue.length}</strong> queued change${state.queue.length===1?'':'s'} to Google Sheet…`);
-  const batch=clone(state.queue);
+  if(!state.serverOnline||!state.queue.length||state.uploading)return;
+  state.uploading=true;updateUploadStatus();
+  const batch=clone(state.queue.slice(0,Math.max(1,CONFIG.QUEUE_BATCH_SIZE)));
+  const batchIds=new Set(batch.map(x=>x.clientId));
+  setBanner('warn',`Uploading <strong>${state.queue.length}</strong> queued change${state.queue.length===1?'':'s'} to Google Sheet…`);
   callServer('api_applyQueue',[batch],r=>{
-    state.queue=[];state.serverData=r.data||state.serverData;state.localDraft=clone(state.serverData);state.uploading=false;persistLocal();updateUploadStatus();
-    setBanner('good',`Upload confirmed ✓ · Google Sheet saved ${fmtDateTime(r.meta?.lastSync||nowISO())}`);render();
-    if(!silent)showToast('All queued changes uploaded successfully.');
+    state.serverData=r.data||state.serverData;
+    state.queue=state.queue.filter(x=>!batchIds.has(x.clientId));
+    state.uploading=false;
+    if(!state.queue.length)state.localDraft=clone(state.serverData);
+    persistLocal();updateUploadStatus();
+    const remaining=state.queue.length;
+    setBanner('good',`Upload confirmed ✓ · Google Sheet saved ${fmtDateTime(r.meta?.lastSync||nowISO())}${remaining?` · <strong>${remaining}</strong> change${remaining===1?'':'s'} still uploading`:''}`);
+    render();
+    if(remaining)flushQueue(true);
+    else if(!silent)showToast('All queued changes uploaded successfully.');
   },e=>{
     state.uploading=false;state.serverOnline=false;setStatus('offline','Offline');
     setBanner('bad',`Upload failed. <strong>${state.queue.length}</strong> change${state.queue.length===1?'':'s'} remain safely queued in this browser.<br><span class="help">The dashboard will not discard unsynchronized data.</span>`);persistLocal();render();
